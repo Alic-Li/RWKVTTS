@@ -12,6 +12,7 @@ export PYTHONPATH=$PYTHONPATH:/home/user/CosyVoice:/home/user/RWKVTTS
 conda create -n rwkvtts-311 -y python=3.11
 conda activate rwkvtts-311
 conda install -y -c conda-forge pynini==2.1.6
+sudo apt install cuda-12-6  
 cd RWKVTTS
 pip install -r rwkvtts_requirements.txt
 ``` 
