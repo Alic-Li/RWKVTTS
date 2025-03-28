@@ -1,3 +1,4 @@
+from operator import is_
 from click import Option, prompt
 from numpy import dtype
 from pydantic import InstanceOf
@@ -12,7 +13,7 @@ from torch.nn.utils.rnn import pad_sequence, unpad_sequence
 import torch.nn.functional as F
 from cosyvoice.utils.common import th_accuracy
 from transformers import AutoModelForCausalLM, AutoTokenizer,AutoConfig
-
+import time
 class RWKV7LM(nn.Module):
     def __init__(
             self,
@@ -24,6 +25,8 @@ class RWKV7LM(nn.Module):
             length_normalized_loss: bool = True,
             lsm_weight: float = 0.0,
             mix_ratio: List[int] = [5, 15],
+            drop_ratio = 0.0,
+            vocab_size = 0,
     ):
         super(RWKV7LM, self).__init__()
         self.llm_input_size = llm_input_size
@@ -40,10 +43,13 @@ class RWKV7LM(nn.Module):
             #load configuration and init model withouth loading weights
             model_configuration = AutoConfig.from_pretrained(llm,trust_remote_code=True)
             self.llm = AutoModelForCausalLM.from_config(model_configuration,trust_remote_code=True)
+            if vocab_size != 0:
+                from train_scripts.train_functions import alter_emb_and_head # Only used for inference
+                self.llm = alter_emb_and_head(self.llm,vocab_size,speech_token_size)
         else:
             self.llm = llm
         self.text_embedding = self.llm.get_input_embeddings()
-        self.llm_decoder = nn.Linear(llm_output_size, speech_token_size + 1)
+        # self.llm_decoder = nn.Linear(llm_output_size, speech_token_size + 1)
         self.criterion_ce = LabelSmoothingLoss(
             size=speech_token_size + 1,
             padding_idx=IGNORE_ID,
@@ -58,6 +64,12 @@ class RWKV7LM(nn.Module):
         self.sampling = sampling
         self.mix_ratio = mix_ratio
         
+        #Dropout
+        if drop_ratio > 0:
+            self.dropout = nn.Dropout(drop_ratio)
+        else:
+            self.dropout = None
+        
     def pad_unpad_sequence(self, sos_eos_emb, text_token, text_token_len, task_id_emb, speech_token, speech_token_len):
         device = text_token.device
         text_token = unpad_sequence(text_token, text_token_len.cpu(), batch_first=True)
@@ -71,7 +83,7 @@ class RWKV7LM(nn.Module):
         return lm_input, attention_mask
     def forward(
             self,
-            batch: dict
+            batch: dict,
     ) -> Dict[str, Optional[torch.Tensor]]:
         """
         Args:
@@ -108,11 +120,13 @@ class RWKV7LM(nn.Module):
         # 5.1 create attention mask
         # attention mask is [1,text_token_len,1,sp_token_len,0,0,0]
         
-
+        if self.dropout is not None:
+            lm_input = self.dropout(lm_input)
         # 6. run lm forward
         lm_output = self.llm(inputs_embeds=lm_input, attention_mask=attention_mask,output_hidden_states=True,return_dict=True)
-        hidden_states = lm_output.hidden_states[-1]
-        logits = self.llm_decoder(hidden_states)
+        # hidden_states = lm_output.hidden_states[-1]
+        # logits = self.llm_decoder(hidden_states)
+        logits = lm_output.logits
         lm_target = lm_target[:, 1:].contiguous()
         loss = self.criterion_ce(logits, lm_target)
         acc = th_accuracy(logits.view(-1, self.speech_token_size + 1), lm_target, ignore_label=IGNORE_ID)
@@ -131,7 +145,7 @@ class RWKV7LM(nn.Module):
     
     def forward_one_step(self, xs, masks, cache=None):
         input_masks = masks[:, -1, :]
-        outs = self.llm.model(
+        outs = self.llm(
             inputs_embeds=xs,
             attention_mask=input_masks,
             output_hidden_states=True,
@@ -139,9 +153,9 @@ class RWKV7LM(nn.Module):
             use_cache=True,
             past_key_values=cache,
         )
-        xs = outs.hidden_states[-1]
+        logits = outs.logits
         new_cache = outs.past_key_values
-        return xs, new_cache
+        return logits, new_cache
     
     def sampling_ids(
             self,
@@ -157,9 +171,10 @@ class RWKV7LM(nn.Module):
                 break
             num_trials += 1
             if num_trials > max_trials:
+                print(f'decoded_tokens is {decoded_tokens}, top_ids is {top_ids}, sampling is {sampling}, ignore_eos is {ignore_eos}')
                 raise RuntimeError('sampling reaches max_trials {} and still get eos when ignore_eos is True, check your input!'.format(max_trials))
         return top_ids
-    
+    @torch.inference_mode
     def inference(
             self,
             text: torch.Tensor,
@@ -173,16 +188,30 @@ class RWKV7LM(nn.Module):
             max_token_text_ratio: float = 20,
             min_token_text_ratio: float = 2,
     ) -> Generator[torch.Tensor, None, None]:
-        print(f'prompt_text is {prompt_text}')
-        print(f'prompt_text_len is {prompt_text_len}')
-        print(f'prompt_speech_token is {prompt_speech_token}')
-        print(f'prompt_speech_token_len is {prompt_speech_token_len}')
-        print(f'text is {text}')
-        print(f'text_len is {text_len}')
         device = text.device
         text = torch.concat([prompt_text, text], dim=1)
+        
+        end_of_prompt_id = 65531
+        #find the length of instruction and text the text is [prompt, end_of_prompt, text]
+        end_of_prompt_mask = (text == end_of_prompt_id)
+        # 使用nonzero找到所有匹配的索引
+        end_of_prompt_indices = end_of_prompt_mask.nonzero()
+        
+        # 默认值：没有找到end_of_prompt_id
+        instruction_length = 0
+        content_length = text_len
+        
+        # 如果找到了end_of_prompt_id
+        if end_of_prompt_indices.size(0) > 0:
+            # 获取第一个匹配的索引（只考虑第一个出现的end_of_prompt_id）
+            # 由于text是二维张量 [batch, seq_len]，我们需要第二个维度的索引
+            instruction_length = end_of_prompt_indices[0, 1].item()
+            content_length = text_len - (instruction_length + 1)  # +1是因为要跳过end_of_prompt_id标记本身
+            # print(f'找到end_of_prompt标记，指令长度: {instruction_length}, 内容长度: {content_length}')
+    
         text_len += prompt_text_len
         text = self.text_embedding(text)
+        
 
         # 3. concat llm_input
         sos_eos_emb = self.llm_embedding.weight[self.sos_eos].reshape(1, 1, -1)
@@ -194,17 +223,23 @@ class RWKV7LM(nn.Module):
         lm_input = torch.concat([sos_eos_emb, text, task_id_emb, prompt_speech_token_emb], dim=1)
 
         # 4. cal min/max_length
-        min_len = int((text_len - prompt_text_len) * min_token_text_ratio)
-        max_len = int((text_len - prompt_text_len) * max_token_text_ratio)
-
+        min_len = content_length * min_token_text_ratio
+        max_len = content_length * max_token_text_ratio
+        # print(f'min_len is {min_len}, max_len is {max_len}')
         # 5. step by step decode
         out_tokens = []
         cache = None
+        start_time = time.time()
+        end_time = 0
+        is_prefill = True
+        prefill_time = 0
+        prefill_length = lm_input.shape[1]
         for i in range(max_len):
-            y_pred, cache = self.forward_one_step(lm_input,
+            logits, cache = self.forward_one_step(lm_input,
                                                       masks=torch.tril(torch.ones((1, lm_input.shape[1], lm_input.shape[1]), device=lm_input.device)).to(torch.bool),
                                                       cache=cache)
-            logp = self.llm_decoder(y_pred[:, -1]).log_softmax(dim=-1)
+            # print(f'logits.shap is {logits.shape}')
+            logp = logits[:,-1].log_softmax(dim=-1)
             top_ids = self.sampling_ids(logp.squeeze(dim=0), out_tokens, sampling, ignore_eos=True if i < min_len else False).item()
             if top_ids == self.speech_token_size:
                 break
@@ -214,6 +249,14 @@ class RWKV7LM(nn.Module):
             yield top_ids
             out_tokens.append(top_ids)
             lm_input = self.speech_embedding.weight[top_ids].reshape(1, 1, -1)
+            if is_prefill:
+                prefill_time = time.time() - start_time
+                is_prefill = False
+        end_time = time.time()
+        decode_time = end_time - start_time - prefill_time
+        decoded_length = len(out_tokens)
+        print(f'tps for prefill is {prefill_length/prefill_time}. {prefill_length} tokens in {prefill_time} seconds')
+        print(f'tps for decode is {decoded_length/decode_time}. {decoded_length} tokens in {decode_time} seconds')
         print(f'out_tokens is {out_tokens}')
     
 if __name__ == '__main__':

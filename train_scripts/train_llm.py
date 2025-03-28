@@ -19,7 +19,7 @@ import time
 import regex as re
 from data.utils.llm_dataset import load_jsonl_dataset, collate_fn
 from model.llm.llm import RWKV7LM
-from train_scripts.train_functions import train_step
+from train_scripts.train_functions import train_step,alter_emb_and_head
 logger = logging.getLogger(__name__)
 @dataclass
 class ScriptArguments:
@@ -131,6 +131,16 @@ class ScriptArguments:
         metadata={"help": "drop out"}
     )
     
+    drop_prompt_ratio : float = field(
+        default=0.5,
+        metadata={"help": "drop prompt ratio"}
+    )
+    
+    ckpt_file: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to model checkpoint file"}
+    )
+    
 def setup_logging(local_rank):
     """Configure logging"""
     if local_rank <= 0:
@@ -221,8 +231,32 @@ def main():
     if is_main_process:
         logger.info(f"Loading tokenizer from {args.model_name}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name,trust_remote_code=True)
-    tokenizer.add_special_tokens({'pad_token': '<|rwkv_tokenizer_end_of_text|>'})
-    
+    # special_tokens = {
+    #         'pad_token': '<|rwkv_tokenizer_end_of_text|>',
+    #         'additional_special_tokens': [
+    #             '<|endofprompt|>',
+    #             '[breath]', '<strong>', '</strong>', '[noise]',
+    #             '[laughter]', '[cough]', '[clucking]', '[accent]',
+    #             '[quick_breath]',
+    #             "<laughter>", "</laughter>",
+    #             "[hissing]", "[sigh]", "[vocalized-noise]",
+    #             "[lipsmack]", "[mn]"
+    #         ]
+    #     }
+    special_tokens = {
+            'pad_token': '<|rwkv_tokenizer_end_of_text|>',
+            'additional_special_tokens': [
+                '<|endofprompt|>',
+                '[breath]', '<strong>', '</strong>', '[noise]',
+                '[laughter]', '[cough]', '[clucking]', '[accent]',
+                '[quick_breath]',
+                "<laughter>", "</laughter>",
+                "[hissing]", "[sigh]", "[vocalized-noise]",
+                "[lipsmack]", "[mn]"
+            ]
+        }
+    tokenizer.add_special_tokens(special_tokens)
+    vocab_size = tokenizer.vocab_size
     # Load dataset
     if is_main_process:
         logger.info(f"Loading dataset from {args.data_file}")
@@ -300,12 +334,19 @@ def main():
     if is_main_process:
         logger.info(f"Initializing model with DeepSpeed config")
     model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16,trust_remote_code=True)
+    model = alter_emb_and_head(model,vocab_size,args.speech_token_size)
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
     model.train()
     llm_input_size = model.config.hidden_size
     llm_output_size = model.config.hidden_size
-    model  = RWKV7LM(llm_input_size,llm_output_size,args.speech_token_size,model,None)
+    model  = RWKV7LM(llm_input_size,llm_output_size,args.speech_token_size,model,None,drop_ratio=args.drop_out)
+    if args.ckpt_file is not None:
+        if is_main_process:
+            logger.info(f"Loading checkpoint from {args.ckpt_file}")
+        info = model.load_state_dict(torch.load(args.ckpt_file))
+        if is_main_process:
+            logger.info(f"Loaded checkpoint info: {info}")
     model.train()
     if is_main_process:
         logger.info(f'Enable gradient checkpointing: {args.gradient_checkpointing}')
